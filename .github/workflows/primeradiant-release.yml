@@ -1,0 +1,70 @@
+# Builds and publishes the Prime Radiant fork's release binaries (PRIME-RADIANT.md).
+# Only the two platforms we run: Linux x86_64 (dev boxes, Azure CI) and Apple Silicon Macs.
+# Chao's scripts/rustc-wrapper.sh downloads these by tag and checks their SHA-256.
+name: primeradiant-release
+
+on:
+  push:
+    tags: ['v*-primeradiant.*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            # Upstream's release image: musl cross compilers, so the binary is static.
+            container: messense/rust-musl-cross:x86_64-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Check the tag matches the crate version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] ||
+            { echo "::error::tag $GITHUB_REF_NAME but Cargo.toml says $version"; exit 1; }
+      - name: Build
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --locked --release --bin sccache --target ${{ matrix.target }} --features=openssl/vendored
+      - name: Package
+        shell: bash
+        run: |
+          name="sccache-$GITHUB_REF_NAME-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/sccache" README.md LICENSE PRIME-RADIANT.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && { sha256sum "$name.tar.gz" 2>/dev/null || shasum -a 256 "$name.tar.gz"; } > "$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Prime Radiant fork: upstream plus mozilla/sccache#3065. See PRIME-RADIANT.md."
